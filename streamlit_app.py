@@ -33,6 +33,9 @@ import streamlit as st
 from inspect import signature
 from datetime import datetime
 
+import re
+from sentence_transformers import SentenceTransformer
+
 # Sklearn & friends
 from sklearn.model_selection import KFold, train_test_split, learning_curve
 from sklearn.metrics import mean_squared_error, r2_score
@@ -296,211 +299,330 @@ def preprocess(train_df: pd.DataFrame, test_df: pd.DataFrame | None) -> T.Tuple[
     return X_train, X_test, y
 
 # -----------------------------
-# Recommendation Tab (entegre)
-# -----------------------------
-# -----------------------------
-# Recommendation Tab (entegre)
+# Recommendation Tab (SBERT entegre)
 # -----------------------------
 with reco_tab:
-    st.subheader("🎬 Öneri Sistemi")
+    st.subheader("🎬 Öneri Sistemi (SBERT + Hibrit Skor)")
 
     if train_df_raw.empty:
-        st.info("Önce sol menüden train.csv yükleyin. (Tercihen: title / overview / genres sütunları)")
-    else:
-        # --- Sütun bulucu yardımcı ---
-        def _pick_col(df, candidates):
-            for c in candidates:
-                if c in df.columns:
-                    return c
-            low = {c.lower(): c for c in df.columns}
-            for c in candidates:
-                if c.lower() in low:
-                    return low[c.lower()]
-            return None
+        st.info("Önce sol menüden train.csv yükleyin. (Tercihen: title / original_title / overview / genres / cast / crew / release_date sütunları)")
+        st.stop()
 
-        # --- Metin birleştirme (overview + genres) ---
-        def _combined_text(df, title_col, overview_col, genre_col):
-            import pandas as pd, ast
-            def _genres_to_words(x):
-                if pd.isna(x): return ""
-                s = str(x)
-                try:
-                    obj = ast.literal_eval(s)
-                    if isinstance(obj, list):
-                        names = []
-                        for it in obj:
-                            if isinstance(it, dict) and it.get("name"):
-                                names.append(str(it["name"]))
-                            elif isinstance(it, str):
-                                names.append(it)
-                        return " ".join(names)
-                except Exception:
-                    pass
-                return s  # düz metin ise aynen ekle
-            parts = []
-            if overview_col and overview_col in df.columns:
-                parts.append(df[overview_col].astype(str))
-            if genre_col and genre_col in df.columns:
-                parts.append(df[genre_col].apply(_genres_to_words).astype(str))
-            if not parts:
-                return pd.Series([""] * len(df))
-            s = pd.Series([""] * len(df))
-            for p in parts:
-                s = s.str.cat(p.fillna(""), sep=" ")
-            return s.str.replace(r"\s+", " ", regex=True).str.strip()
+    # --- Sütun bulucu yardımcı ---
+    def _pick_col(df, candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        low = {c.lower(): c for c in df.columns}
+        for c in candidates:
+            if c.lower() in low:
+                return low[c.lower()]
+        return None
 
-        title_col    = _pick_col(train_df_raw, ["title","original_title","movie_title","Title"])
-        overview_col = _pick_col(train_df_raw, ["overview","description","plot","tagline"])
-        genre_col    = _pick_col(train_df_raw, ["genres","genre","main_genre"])
+    # Veri setinde hangi kolonlar var, tespit et
+    title_col    = _pick_col(train_df_raw, ["title","original_title","movie_title","Title"])
+    orig_title   = _pick_col(train_df_raw, ["original_title","orig_title"])
+    overview_col = _pick_col(train_df_raw, ["overview","description","plot","tagline"])
+    tagline_col  = _pick_col(train_df_raw, ["tagline"])
+    genres_col   = _pick_col(train_df_raw, ["genres","genre","main_genre"])
+    keywords_col = _pick_col(train_df_raw, ["Keywords","keywords"])
+    cast_col     = _pick_col(train_df_raw, ["cast","actors"])
+    crew_col     = _pick_col(train_df_raw, ["crew","credits"])
+    rdate_col    = _pick_col(train_df_raw, ["release_date","date"])
 
-        if not title_col:
-            st.error("Film başlığı sütunu bulunamadı (title / original_title vb.).")
-            st.stop()
-        if not (overview_col or genre_col):
-            st.error("overview/description veya genres/genre sütunlarından en az biri gerekli.")
-            st.stop()
+    if not title_col and not orig_title:
+        st.error("Film başlığı için 'title' veya 'original_title' bulunmalı.")
+        st.stop()
 
-        # --- Vektörleştirme (cache) ---
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
+    # Recommender için beklenen kolon isimlerine map’leyip kopya DataFrame oluşturalım
+    df_rec_src = train_df_raw.copy()
+    def _safe_col(src, col, default):
+        return src[col] if col and col in src.columns else default
 
-        @st.cache_resource(show_spinner=False)
-        def _build_vector_space(df_text: pd.Series):
-            vec = TfidfVectorizer(stop_words="english", max_features=100_000, ngram_range=(1,2))
-            X = vec.fit_transform(df_text.fillna(""))
-            return vec, X
+    df_rec = pd.DataFrame({
+        "title":           _safe_col(df_rec_src, title_col, df_rec_src.get(orig_title, pd.Series([""]*len(df_rec_src)))),
+        "original_title":  _safe_col(df_rec_src, orig_title, df_rec_src.get(title_col, pd.Series([""]*len(df_rec_src)))),
+        "overview":        _safe_col(df_rec_src, overview_col, ""),
+        "tagline":         _safe_col(df_rec_src, tagline_col, ""),
+        "genres":          _safe_col(df_rec_src, genres_col, "[]"),
+        "Keywords":        _safe_col(df_rec_src, keywords_col, "[]"),
+        "cast":            _safe_col(df_rec_src, cast_col, "[]"),
+        "crew":            _safe_col(df_rec_src, crew_col, "[]"),
+        "release_date":    _safe_col(df_rec_src, rdate_col, None),
+    })
 
-        df_rec = train_df_raw[[title_col] + [c for c in [overview_col, genre_col] if c]].copy()
-        df_rec["_combined_text_"] = _combined_text(df_rec, title_col, overview_col, genre_col)
-        vec, X = _build_vector_space(df_rec["_combined_text_"])
+    # --- Recommender fonksiyonları (özet; canvas’taki tam sürümle uyumlu) ---
+    def _safe_list(x):
+        if isinstance(x, list): return x
+        if isinstance(x, str):
+            try: return ast.literal_eval(x)
+            except Exception: return []
+        return []
 
-        # --- UI ---
-        st.caption("Aşağıdan bir film seçerek veya serbest sorgu yazarak benzer film önerileri alabilirsiniz.")
-        colA, colB = st.columns([2, 1])
-        with colA:
-            titles = (
-                df_rec[title_col]
-                .astype(str).dropna().drop_duplicates().sort_values()
-                .tolist()
+    def _set_names(x):
+        out=set()
+        for q in _safe_list(x):
+            if isinstance(q, dict) and q.get("name"):
+                out.add(str(q["name"]).strip().lower())
+            elif isinstance(q, str):
+                out.add(q.strip().lower())
+        return out
+
+    def _cast_names(x, top_k=10):
+        items=_safe_list(x)
+        if items and isinstance(items[0], dict) and 'order' in items[0]:
+            items=sorted(items, key=lambda d: d.get('order', 10**9))
+        out=[]
+        for q in items:
+            n = q.get("name") if isinstance(q, dict) else q
+            if n: out.append(str(n).strip().lower())
+        return set(out[:top_k])
+
+    def _dir_names(x):
+        out=set()
+        for q in _safe_list(x):
+            if isinstance(q, dict):
+                if "director" in str(q.get("job","")).lower() and q.get("name"):
+                    out.add(str(q["name"]).strip().lower())
+            elif isinstance(q, str):
+                # metin geldiyse yönetmen adını listeye al
+                out.add(q.strip().lower())
+        return out
+
+    def _join_words(s): 
+        return " ".join(sorted(list(s))).replace(" ","_")
+
+    @st.cache_resource(show_spinner=True)
+    def _build_recommender_cached(df_all: pd.DataFrame, model_name="sentence-transformers/all-mpnet-base-v2"):
+        m = SentenceTransformer(model_name)
+        d = df_all.copy()
+        d.fillna({'overview':'','tagline':'','Keywords':'[]','genres':'[]','cast':'[]','crew':'[]'}, inplace=True)
+        d["combined_text_rec"] = (
+            d["overview"].astype(str) + " " + d.get("tagline","").astype(str) + " " +
+            d["genres"].apply(_set_names).apply(_join_words) + " " +
+            d["Keywords"].apply(_set_names).apply(_join_words) + " " +
+            d["cast"].apply(_cast_names).apply(_join_words) + " " +
+            d["crew"].apply(_dir_names).apply(_join_words)
+        ).str.strip()
+        E = m.encode(d["combined_text_rec"].tolist(), batch_size=64, convert_to_numpy=True, normalize_embeddings=True)
+        titles_full = d['title'].fillna(d['original_title']).astype(str).tolist()
+        years = pd.to_datetime(d["release_date"], errors="coerce").dt.year.fillna(-1).astype(int).to_numpy()
+        title_map={}
+        def _norm_title(t):
+            t = re.sub(r'\s*\(\d{4}\)\s*$','',str(t))
+            t = re.sub(r'\s+',' ',t).strip().lower()
+            return t
+        for i,t in enumerate(titles_full):
+            n=_norm_title(t); title_map.setdefault(n, []).append(i)
+        return {
+            "df": d, "model": m, "emb": E, "titles_full": titles_full,
+            "title_map": title_map, "years": years,
+            "genres": d["genres"].apply(_set_names).tolist(),
+            "keywords": d["Keywords"].apply(_set_names).tolist(),
+            "cast": d["cast"].apply(_cast_names).tolist(),
+            "dirs": d["crew"].apply(_dir_names).tolist()
+        }
+
+    def _apply_rank_postfix(score, titles_full, idx_query,
+                            franchise_tokens=('batman','joker','dc'),
+                            franchise_penalty=0.05,
+                            exclude_same_title=True):
+        def _norm_title_simple(t):
+            t = re.sub(r'\s*\(\d{4}\)\s*$','',str(t)); t = re.sub(r'\s+',' ',t).strip().lower(); return t
+        titles_norm = [_norm_title_simple(t) for t in titles_full]
+        if idx_query is not None and exclude_same_title:
+            t0 = titles_norm[idx_query]
+            same_mask = np.array([(_norm_title_simple(t) == t0) for t in titles_full], dtype=bool)
+            score[same_mask] = -1.0; score[idx_query] = -1.0
+        if idx_query is not None:
+            q_title = titles_norm[idx_query]
+            if any(tok in q_title for tok in franchise_tokens):
+                penalize_mask = np.array([any(tok in t for tok in franchise_tokens) for t in titles_norm], dtype=bool)
+                score[penalize_mask] -= franchise_penalty
+        return score
+
+    def _jac(a,b):
+        u=(a|b); return len(a&b)/len(u) if u else 0.0
+
+    def recommend_by_title(title, rec, top_k=5,
+                           w_sbert=0.45, w_kw=0.30, w_dir=0.15, w_cast=0.10,
+                           force_same_genre=False, min_shared_keywords=0,
+                           prefer_genres=("drama","mystery","thriller"),
+                           year_boost=0.02, year_window=7,
+                           title_match_min_sim=0.45,
+                           franchise_tokens=('batman','joker','dc'),
+                           franchise_penalty=0.05):
+        df=rec["df"]; E=rec["emb"]; titles=rec["titles_full"]; years=rec["years"]
+        G=rec["genres"]; K=rec["keywords"]; C=rec["cast"]; D=rec["dirs"]
+        model=rec["model"]; tmap=rec.get("title_map",{})
+        def _norm_title_simple(t):
+            t = re.sub(r'\s*\(\d{4}\)\s*$','',str(t)); t = re.sub(r'\s+',' ',t).strip().lower(); return t
+        ntitle=_norm_title_simple(title)
+        if ntitle in tmap: idx=tmap[ntitle][0]
+        else:
+            mask = df['title'].fillna('').str.contains(ntitle, case=False, regex=False) | df['original_title'].fillna('').str.contains(ntitle, case=False, regex=False)
+            idxs = df.index[mask].tolist()
+            idx = (idxs[0] if idxs else None)
+            if idx is None:
+                if rec.get("title_emb") is None:
+                    rec["title_emb"] = model.encode(titles, batch_size=64, convert_to_numpy=True, normalize_embeddings=True)
+                qv = model.encode([str(title)], convert_to_numpy=True, normalize_embeddings=True)[0]
+                sims_t = rec["title_emb"] @ qv
+                j = int(np.argmax(sims_t))
+                if float(sims_t[j]) < title_match_min_sim:
+                    raise ValueError(f"Title «{title}» not found (nearest: {titles[j]}, sim={float(sims_t[j]):.2f}).")
+                idx = j
+        sims_sbert = E @ E[idx]
+        sims_kw    = np.array([_jac(K[idx], K[j]) for j in range(len(df))])
+        sims_cast  = np.array([_jac(C[idx], C[j]) for j in range(len(df))])
+        sims_dir   = np.array([_jac(D[idx], D[j]) for j in range(len(df))])
+        score = 0.45*sims_sbert + 0.30*sims_kw + 0.15*sims_dir + 0.10*sims_cast
+        pg=set([g.strip().lower() for g in (prefer_genres or [])])
+        if pg: score += 0.05*np.array([len(pg & G[j]) for j in range(len(df))])
+        mask_valid = np.ones(len(df), dtype=bool)
+        if force_same_genre: mask_valid &= np.array([len(G[idx] & G[j]) > 0 for j in range(len(df))])
+        if min_shared_keywords > 0: mask_valid &= np.array([len(K[idx] & K[j]) >= min_shared_keywords for j in range(len(df))])
+        y0 = years[idx]
+        if y0 != -1 and year_window > 0:
+            delta = np.abs(years - y0)
+            score += 0.02 * np.clip((year_window - delta) / year_window, 0, 1)
+        score = _apply_rank_postfix(score, titles_full=titles, idx_query=idx,
+                                    franchise_tokens=franchise_tokens,
+                                    franchise_penalty=franchise_penalty,
+                                    exclude_same_title=True)
+        score[~mask_valid] = -1.0
+        order = np.argsort(-score)[:top_k]
+        return pd.DataFrame({"title":[titles[j] for j in order], "similarity":[float(score[j]) for j in order]})
+
+    def recommend_by_title_nonfranchise(title, rec, top_k=5,
+                                        franchise_tokens=('batman','joker','gotham','arkham','dark knight'),
+                                        **kwargs):
+        all_recs = recommend_by_title(title, rec, top_k=50,
+                                      franchise_tokens=franchise_tokens,
+                                      franchise_penalty=0.0, **kwargs)
+        patt = '|'.join([re.escape(t) for t in franchise_tokens]) if franchise_tokens else None
+        if patt:
+            mask = ~all_recs['title'].str.lower().str.contains(patt, na=False, regex=True)
+            return all_recs[mask].head(top_k).reset_index(drop=True)
+        return all_recs.head(top_k).reset_index(drop=True)
+
+    def recommend_hybrid(title, rec, top_k=5, nonfr_k=5,
+                         franchise_tokens=('batman','joker','gotham','arkham','dark knight'), **kwargs):
+        nonfr = recommend_by_title_nonfranchise(title, rec, top_k=nonfr_k,
+                                                franchise_tokens=franchise_tokens, **kwargs)
+        has_fr = False
+        if len(nonfr):
+            patt = '|'.join([re.escape(t) for t in franchise_tokens]) if franchise_tokens else None
+            if patt:
+                has_fr = nonfr['title'].str.lower().str.contains(patt, na=False, regex=True).any()
+        if (not has_fr) and franchise_tokens:
+            full = recommend_by_title(title, rec, top_k=10,
+                                      franchise_tokens=franchise_tokens,
+                                      franchise_penalty=0.01, **kwargs)
+            patt = '|'.join([re.escape(t) for t in franchise_tokens])
+            for _, row in full.iterrows():
+                t = str(row['title']).lower()
+                if re.search(patt, t):
+                    nonfr.loc[len(nonfr)] = row
+                    break
+        return nonfr.sort_values('similarity', ascending=False).head(top_k).reset_index(drop=True)
+
+    def recommend_by_query(query, rec, top_k=5, prefer_genres=("science fiction","thriller","mystery"),
+                           k_wide=2000, genre_boost=0.05):
+        model, E = rec["model"], rec["emb"]; titles = rec["titles_full"]; G = rec["genres"]
+        qv = model.encode([str(query)], convert_to_numpy=True, normalize_embeddings=True)[0]
+        sims = E @ qv
+        cand = np.argsort(-sims)[:k_wide]
+        pg = set([g.strip().lower() for g in (prefer_genres or [])])
+        scores=[]
+        for j in cand:
+            bump = genre_boost * len(pg & G[j]) if pg else 0.0
+            scores.append((j, float(sims[j]) + bump))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top=[j for j,_ in scores[:top_k]]
+        return pd.DataFrame({"title":[titles[j] for j in top], "similarity":[float(sims[j]) for j in top]})
+
+    # --- Modeli kur / cache’ten çek
+    with st.spinner("Öneri modeli hazırlanıyor (SBERT gömlemeleri çıkarılıyor)..."):
+        rec_obj = _build_recommender_cached(df_rec)
+
+    # --- UI
+    st.caption("Bir film seçin ya da serbest metin yazın; franchise filtrelemeyi ayarlayın.")
+    colA, colB = st.columns([2, 1])
+    with colA:
+        titles = df_rec["title"].fillna(df_rec["original_title"]).astype(str).dropna().drop_duplicates().sort_values().tolist()
+        film_sec = st.selectbox("Film seç (title-based / hybrid için):", titles, index=0)
+    with colB:
+        top_k = st.slider("Öneri sayısı", 3, 10, 5)
+
+    default_fr_tokens = "batman,joker,gotham,arkham,dark knight"
+    franchise_tokens_in = st.text_input("Franchise filtre anahtarları (virgülle):", value=default_fr_tokens)
+    franchise_tokens = tuple([t.strip().lower() for t in franchise_tokens_in.split(",") if t.strip()])
+
+    # Tür tercihleri (varsa)
+    # df_rec['genres'] list/str olduğu için düz isim seti çıkaralım
+    def _all_genre_names(s):
+        names=set()
+        for x in s:
+            for n in _set_names(x):
+                names.add(n)
+        return sorted(list(names))
+    try:
+        all_genres = _all_genre_names(df_rec["genres"])
+    except Exception:
+        all_genres = []
+    prefer_genres = st.multiselect("Tercih edilen tür(ler)i vurgula", options=all_genres, default=["drama","mystery","thriller"] if "drama" in all_genres else [])
+
+    query_text = st.text_input("Serbest metin (ör. 'space survival thriller')", value="dark gritty crime thriller")
+
+    t1, t2, t3, t4 = st.tabs(["Title-based", "Non-franchise", "Query-based", "Hybrid"])
+
+    with t1:
+        try:
+            out = recommend_by_title(
+                film_sec, rec_obj, top_k=top_k,
+                prefer_genres=tuple(prefer_genres) if prefer_genres else (),
+                franchise_tokens=franchise_tokens, franchise_penalty=0.05
             )
-            film_sec = st.selectbox("Film seç (title-based / hybrid için):", titles, index=0)
-        with colB:
-            top_k = st.slider("Öneri sayısı", 3, 10, 5)
+            st.dataframe(out, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Başlık bazlı öneri başarısız: {e}")
 
-        query_text = st.text_input("Serbest metin (query-based için):", value="dark gritty crime thriller")
-        tokens_default = "batman,joker,gotham,arkham,dark knight"
-        franchise_tokens_in = st.text_input("Franchise filtreleme anahtarları (virgüllü):", value=tokens_default)
-        franchise_tokens = tuple([t.strip().lower() for t in franchise_tokens_in.split(",") if t.strip()])
+    with t2:
+        try:
+            out = recommend_by_title_nonfranchise(
+                film_sec, rec_obj, top_k=top_k,
+                franchise_tokens=franchise_tokens,
+                prefer_genres=tuple(prefer_genres) if prefer_genres else ()
+            )
+            st.dataframe(out, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Non-franchise öneri başarısız: {e}")
 
-        t1, t2, t3, t4 = st.tabs(["Title-based", "Non-franchise", "Query-based", "Hybrid"])
+    with t3:
+        try:
+            if not query_text.strip():
+                st.info("Bir sorgu yazın (ör. 'space survival thriller').")
+            else:
+                out = recommend_by_query(
+                    query_text, rec_obj, top_k=top_k,
+                    prefer_genres=tuple(prefer_genres) if prefer_genres else ()
+                )
+                st.dataframe(out, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Query-based öneri başarısız: {e}")
 
-        # --- Yardımcılar ---
-        def _get_index_for_title(df, title_col, title_str):
-            tlist = df[title_col].astype(str).str.lower().tolist()
-            tlow = str(title_str).lower()
-            try:
-                return tlist.index(tlow)
-            except ValueError:
-                matches = [i for i, t in enumerate(tlist) if t == tlow]
-                return matches[0] if matches else 0
+    with t4:
+        try:
+            out = recommend_hybrid(
+                film_sec, rec_obj, top_k=top_k, nonfr_k=top_k,
+                franchise_tokens=franchise_tokens,
+                prefer_genres=tuple(prefer_genres) if prefer_genres else ()
+            )
+            st.dataframe(out, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Hybrid öneri başarısız: {e}")
 
-        def _mask_nonfranchise(title_series, tokens):
-            t = title_series.astype(str).str.lower()
-            if not tokens:
-                return pd.Series([True]*len(t), index=title_series.index)
-            patt = "|".join([re.escape(tok) for tok in tokens])
-            return ~t.str.contains(patt, na=False)
-
-        import re
-        # --- 1) Title-based ---
-        with t1:
-            try:
-                idx = _get_index_for_title(df_rec, title_col, film_sec)
-                sims = cosine_similarity(X[idx], X).ravel()
-                sims[idx] = -1.0
-                order = np.argsort(-sims)[:top_k]
-                out = df_rec.iloc[order][[title_col]].copy()
-                out["similarity"] = sims[order]
-                st.dataframe(out.reset_index(drop=True), use_container_width=True)
-            except Exception as e:
-                st.warning(f"Başlık bazlı öneri oluşturulamadı: {e}")
-
-        # --- 2) Non-franchise Title-based ---
-        with t2:
-            try:
-                idx = _get_index_for_title(df_rec, title_col, film_sec)
-                sims = cosine_similarity(X[idx], X).ravel()
-                sims[idx] = -1.0
-                # franchise filtre
-                mask_nonfr = _mask_nonfranchise(df_rec[title_col], franchise_tokens).to_numpy()
-                sims[~mask_nonfr] = -1.0
-                order = np.argsort(-sims)[:top_k]
-                out = df_rec.iloc[order][[title_col]].copy()
-                out["similarity"] = sims[order]
-                st.dataframe(out.reset_index(drop=True), use_container_width=True)
-            except Exception as e:
-                st.warning(f"Non-franchise öneri oluşturulamadı: {e}")
-
-        # --- 3) Query-based ---
-        with t3:
-            try:
-                if not query_text.strip():
-                    st.info("Bir sorgu yazın (ör. 'space survival thriller').")
-                else:
-                    Xq = vec.transform([query_text])
-                    sims = cosine_similarity(Xq, X).ravel()
-                    order = np.argsort(-sims)[:top_k]
-                    out = df_rec.iloc[order][[title_col]].copy()
-                    out["similarity"] = sims[order]
-                    st.dataframe(out.reset_index(drop=True), use_container_width=True)
-            except Exception as e:
-                st.warning(f"Query-based öneri oluşturulamadı: {e}")
-
-        # --- 4) Hybrid (önce non-franchise, yoksa 1 franchise ekle) ---
-        with t4:
-            try:
-                idx = _get_index_for_title(df_rec, title_col, film_sec)
-                sims_full = cosine_similarity(X[idx], X).ravel()
-                sims_full[idx] = -1.0
-
-                # non-franchise ilk liste
-                mask_nonfr = _mask_nonfranchise(df_rec[title_col], franchise_tokens).to_numpy()
-                sims_nonfr = sims_full.copy()
-                sims_nonfr[~mask_nonfr] = -1.0
-                order_nonfr = np.argsort(-sims_nonfr)
-
-                picks = []
-                for j in order_nonfr:
-                    if sims_nonfr[j] <= -1.0: break
-                    picks.append(j)
-                    if len(picks) == top_k: break
-
-                # eğer hiç franchise içermiyorsa, full listeden bir tane franchise ekle
-                contains_franchise = False
-                if picks:
-                    titles_lower = df_rec.iloc[picks][title_col].astype(str).str.lower().tolist()
-                    if franchise_tokens:
-                        patt = "|".join([re.escape(tok) for tok in franchise_tokens])
-                        contains_franchise = any(re.search(patt, t) for t in titles_lower)
-
-                if (not contains_franchise) and len(picks) < top_k and franchise_tokens:
-                    patt = "|".join([re.escape(tok) for tok in franchise_tokens])
-                    titles_lower_full = df_rec[title_col].astype(str).str.lower().tolist()
-                    # full sıralamada ilk franchise'ı bul
-                    for j in np.argsort(-sims_full):
-                        if sims_full[j] <= -1.0: break
-                        if re.search(patt, titles_lower_full[j]) and j not in picks:
-                            picks.append(j)
-                            break
-
-                picks = picks[:top_k]
-                out = df_rec.iloc[picks][[title_col]].copy()
-                # hangi benzerlikten geldiğini görmek için full similarity yazıyoruz
-                out["similarity"] = sims_full[pd.Index(df_rec.index).get_indexer(picks)]
-                st.dataframe(out.reset_index(drop=True), use_container_width=True)
-            except Exception as e:
-                st.warning(f"Hybrid öneri oluşturulamadı: {e}")
-                
 # -----------------------------
 # Modeling Tab
 # -----------------------------
