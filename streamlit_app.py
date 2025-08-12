@@ -74,7 +74,7 @@ except Exception:
 # Streamlit Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="Revenue Studio — Movie Revenue Prediction",
+    page_title="Film Gelir Tahmin Platformu",
     page_icon="💸",
     layout="wide",
     initial_sidebar_state="expanded",
